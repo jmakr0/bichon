@@ -634,6 +634,10 @@ Copies blobs from Fjall to bichon-blob. Tantivy indexes and memdb are left untou
 
 ## FAQ
 
+### Can Bichon use a public/native OAuth client without a client secret?
+
+Yes. Select **Public/native client** in the OAuth configuration and follow the [public OAuth client and remote-browser guide](docs/public-oauth-clients.md). It covers the recommended SSH-tunnel flow, an optional loopback-only noVNC fallback, and a user-owned Microsoft Entra application.
+
 ### CORS errors when accessing the WebUI
 
 1. Enable debug logging: `BICHON_LOG_LEVEL=debug`
