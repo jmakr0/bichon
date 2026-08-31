@@ -23,11 +23,22 @@ use crate::{
         MemDbModel,
     },
     encrypt,
-    error::BichonResult,
-    id, utc_now,
+    error::{code::ErrorCode, BichonResult},
+    id, raise_error, utc_now,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+/// Determines whether the OAuth2 client authenticates at the token endpoint.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "web-api", derive(poem_openapi::Enum))]
+pub enum OAuth2ClientType {
+    /// A client with a provider-issued secret.
+    #[default]
+    Confidential,
+    /// A native/public client that relies on PKCE and has no client secret.
+    Public,
+}
 
 /// Represents the OAuth2 configuration for a client, including initialization and runtime values.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -39,12 +50,15 @@ pub struct OAuth2 {
     pub description: Option<String>,
     /// The client ID used for authenticating the application with the OAuth2 provider.
     pub client_id: String,
+    /// The OAuth2 client type. Existing records default to confidential clients.
+    #[serde(default)]
+    pub client_type: OAuth2ClientType,
     /// The client secret used in conjunction with the client ID.
     ///
     /// Users should provide a plaintext secret.
     /// The server will encrypt it using AES-256-GCM and securely store it.
     /// The plaintext secret is never stored, so users must ensure it is valid for OAuth2 authentication.
-    pub client_secret: String,
+    pub client_secret: Option<String>,
     /// The URL to redirect users to for OAuth2 authorization.
     pub auth_url: String,
     /// The URL to exchange authorization codes for access tokens.
@@ -76,12 +90,14 @@ impl MemDbModel for OAuth2 {
 
 impl OAuth2 {
     pub fn new(request: OAuth2CreateRequest) -> BichonResult<Self> {
-        let request = request.encrypt()?;
+        let client_secret =
+            encrypted_secret_for_create(request.client_type, request.client_secret)?;
         Ok(OAuth2 {
             id: id!(64),
             description: request.description,
             client_id: request.client_id,
-            client_secret: request.client_secret,
+            client_type: request.client_type,
+            client_secret,
             auth_url: request.auth_url,
             token_url: request.token_url,
             redirect_uri: request.redirect_uri,
@@ -106,7 +122,7 @@ impl OAuth2 {
         self.description = Some(format!("{}{}", original_desc, notice));
 
         self.client_id = mask.to_string();
-        self.client_secret = mask.to_string();
+        self.client_secret = self.client_secret.as_ref().map(|_| mask.to_string());
         self.auth_url = self.auth_url.clone();
         self.token_url = self.token_url.clone();
         self.redirect_uri = self.redirect_uri.clone();
@@ -156,8 +172,13 @@ pub struct OAuth2CreateRequest {
     /// The client ID used for authenticating the application with the OAuth2 provider.
     pub client_id: String,
 
+    /// Whether the OAuth2 client is confidential or public/native.
+    #[serde(default)]
+    #[cfg_attr(feature = "web-api", oai(default))]
+    pub client_type: OAuth2ClientType,
+
     /// The client secret used in conjunction with the client ID.
-    pub client_secret: String,
+    pub client_secret: Option<String>,
 
     /// The URL to redirect users to for OAuth2 authorization.
     pub auth_url: String,
@@ -181,23 +202,6 @@ pub struct OAuth2CreateRequest {
     pub use_proxy: Option<u64>,
 }
 
-impl OAuth2CreateRequest {
-    pub fn encrypt(self) -> BichonResult<Self> {
-        Ok(Self {
-            description: self.description,
-            client_id: self.client_id,
-            client_secret: encrypt!(&self.client_secret)?,
-            auth_url: self.auth_url,
-            token_url: self.token_url,
-            redirect_uri: self.redirect_uri,
-            scopes: self.scopes,
-            extra_params: self.extra_params,
-            enabled: self.enabled,
-            use_proxy: self.use_proxy,
-        })
-    }
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "web-api", derive(poem_openapi::Object))]
 pub struct OAuth2UpdateRequest {
@@ -206,6 +210,9 @@ pub struct OAuth2UpdateRequest {
 
     /// The client ID used for authenticating the application with the OAuth2 provider.
     pub client_id: Option<String>,
+
+    /// Whether the OAuth2 client is confidential or public/native.
+    pub client_type: Option<OAuth2ClientType>,
 
     /// The client secret used in conjunction with the client ID.
     pub client_secret: Option<String>,
@@ -234,14 +241,16 @@ pub struct OAuth2UpdateRequest {
 
 fn apply_update(old: &OAuth2, request: OAuth2UpdateRequest) -> BichonResult<OAuth2> {
     let mut new = old.clone();
+    let target_client_type = request.client_type.unwrap_or(old.client_type);
+    new.client_secret =
+        encrypted_secret_for_update(old, target_client_type, request.client_secret.as_deref())?;
+    new.client_type = target_client_type;
+
     if request.description.is_some() {
         new.description = request.description;
     }
     if let Some(client_id) = request.client_id {
         new.client_id = client_id;
-    }
-    if let Some(client_secret) = request.client_secret {
-        new.client_secret = encrypt!(&client_secret)?;
     }
     if let Some(auth_url) = request.auth_url {
         new.auth_url = auth_url;
@@ -266,4 +275,195 @@ fn apply_update(old: &OAuth2, request: OAuth2UpdateRequest) -> BichonResult<OAut
     }
     new.updated_at = utc_now!();
     Ok(new)
+}
+
+fn nonblank_secret(secret: Option<&str>) -> Option<&str> {
+    secret.filter(|value| !value.trim().is_empty())
+}
+
+fn encrypted_secret_for_create(
+    client_type: OAuth2ClientType,
+    client_secret: Option<String>,
+) -> BichonResult<Option<String>> {
+    match client_type {
+        OAuth2ClientType::Confidential => {
+            let secret = nonblank_secret(client_secret.as_deref()).ok_or_else(|| {
+                raise_error!(
+                    "A nonblank client secret is required for confidential OAuth2 clients.".into(),
+                    ErrorCode::InvalidParameter
+                )
+            })?;
+            Ok(Some(encrypt!(secret)?))
+        }
+        OAuth2ClientType::Public => {
+            if nonblank_secret(client_secret.as_deref()).is_some() {
+                return Err(raise_error!(
+                    "Public OAuth2 clients must not include a client secret.".into(),
+                    ErrorCode::InvalidParameter
+                ));
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn encrypted_secret_for_update(
+    old: &OAuth2,
+    target_client_type: OAuth2ClientType,
+    supplied_secret: Option<&str>,
+) -> BichonResult<Option<String>> {
+    match target_client_type {
+        OAuth2ClientType::Public => {
+            if nonblank_secret(supplied_secret).is_some() {
+                return Err(raise_error!(
+                    "Public OAuth2 clients must not include a client secret.".into(),
+                    ErrorCode::InvalidParameter
+                ));
+            }
+            Ok(None)
+        }
+        OAuth2ClientType::Confidential => {
+            if let Some(secret) = nonblank_secret(supplied_secret) {
+                return Ok(Some(encrypt!(secret)?));
+            }
+
+            if old.client_type == OAuth2ClientType::Confidential {
+                return old.client_secret.clone().map(Some).ok_or_else(|| {
+                    raise_error!(
+                        "The confidential OAuth2 client has no stored client secret. Supply a new secret."
+                            .into(),
+                        ErrorCode::InvalidParameter
+                    )
+                });
+            }
+
+            Err(raise_error!(
+                "A new client secret is required when changing a public OAuth2 client to confidential."
+                    .into(),
+                ErrorCode::InvalidParameter
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Once;
+
+    static SET_TEST_PASSWORD: Once = Once::new();
+
+    fn set_test_encryption_password() {
+        SET_TEST_PASSWORD.call_once(|| {
+            std::env::set_var(
+                "BICHON_ENCRYPT_PASSWORD",
+                "oauth2-public-client-test-password",
+            );
+        });
+    }
+
+    fn create_request(
+        client_type: OAuth2ClientType,
+        client_secret: Option<&str>,
+    ) -> OAuth2CreateRequest {
+        OAuth2CreateRequest {
+            description: Some("test".into()),
+            client_id: "client-id".into(),
+            client_type,
+            client_secret: client_secret.map(str::to_owned),
+            auth_url: "https://provider.example/authorize".into(),
+            token_url: "https://provider.example/token".into(),
+            redirect_uri: "http://127.0.0.1:15630/oauth2/callback".into(),
+            scopes: None,
+            extra_params: None,
+            enabled: true,
+            use_proxy: None,
+        }
+    }
+
+    #[test]
+    fn existing_records_default_to_confidential() {
+        let value = serde_json::json!({
+            "id": 1,
+            "description": "existing",
+            "client_id": "client-id",
+            "client_secret": "encrypted-secret",
+            "auth_url": "https://provider.example/authorize",
+            "token_url": "https://provider.example/token",
+            "redirect_uri": "http://127.0.0.1:15630/oauth2/callback",
+            "scopes": null,
+            "extra_params": null,
+            "enabled": true,
+            "use_proxy": null,
+            "created_at": 1,
+            "updated_at": 1
+        });
+
+        let oauth2: OAuth2 = serde_json::from_value(value).unwrap();
+        assert_eq!(oauth2.client_type, OAuth2ClientType::Confidential);
+        assert_eq!(oauth2.client_secret.as_deref(), Some("encrypted-secret"));
+    }
+
+    #[test]
+    fn create_validates_secret_for_client_type() {
+        set_test_encryption_password();
+        assert!(OAuth2::new(create_request(
+            OAuth2ClientType::Confidential,
+            Some("secret")
+        ))
+        .is_ok());
+        assert!(OAuth2::new(create_request(OAuth2ClientType::Confidential, None)).is_err());
+
+        let public = OAuth2::new(create_request(OAuth2ClientType::Public, None)).unwrap();
+        assert!(public.client_secret.is_none());
+        assert!(OAuth2::new(create_request(OAuth2ClientType::Public, Some("secret"))).is_err());
+    }
+
+    #[test]
+    fn update_preserves_or_clears_secrets_and_validates_transitions() {
+        set_test_encryption_password();
+        let confidential = OAuth2::new(create_request(
+            OAuth2ClientType::Confidential,
+            Some("secret"),
+        ))
+        .unwrap();
+        let original_secret = confidential.client_secret.clone();
+
+        let preserved = apply_update(&confidential, OAuth2UpdateRequest::default()).unwrap();
+        assert_eq!(preserved.client_secret, original_secret);
+
+        let public = apply_update(
+            &confidential,
+            OAuth2UpdateRequest {
+                client_type: Some(OAuth2ClientType::Public),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(public.client_secret.is_none());
+
+        assert!(apply_update(
+            &public,
+            OAuth2UpdateRequest {
+                client_type: Some(OAuth2ClientType::Confidential),
+                ..Default::default()
+            }
+        )
+        .is_err());
+
+        let confidential_again = apply_update(
+            &public,
+            OAuth2UpdateRequest {
+                client_type: Some(OAuth2ClientType::Confidential),
+                client_secret: Some("new-secret".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            confidential_again.client_type,
+            OAuth2ClientType::Confidential
+        );
+        assert!(confidential_again.client_secret.is_some());
+    }
 }

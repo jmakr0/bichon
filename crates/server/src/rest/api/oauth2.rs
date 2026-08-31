@@ -244,9 +244,10 @@ impl OAuth2Api {
     ///      by calling this endpoint again.
     /// 2. If both `oauth2_id` and `refresh_token` are provided, it means the external
     ///    OAuth2 authorization flow has been completed outside Bichon.
-    ///    - Since the OAuth2 configuration (including client_id and client_secret)
-    ///      is already stored in Bichon, the service can use the refresh token
-    ///      to obtain new access tokens automatically.
+    ///    - Since the OAuth2 configuration (including the client ID and, for a
+    ///      confidential client, its client secret) is already stored in Bichon,
+    ///      the service can use the refresh token to obtain new access tokens
+    ///      automatically.
     ///
     /// Note: The `oauth2_id` must reference a valid OAuth2 configuration
     /// already created in Bichon.

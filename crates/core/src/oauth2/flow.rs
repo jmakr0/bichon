@@ -18,7 +18,11 @@
 
 use crate::error::code::ErrorCode;
 use crate::error::BichonResult;
-use crate::oauth2::{entity::OAuth2, pending::OAuth2PendingEntity, token::OAuth2AccessToken};
+use crate::oauth2::{
+    entity::{OAuth2, OAuth2ClientType},
+    pending::OAuth2PendingEntity,
+    token::OAuth2AccessToken,
+};
 use crate::settings::proxy::Proxy;
 use crate::utils::net::parse_proxy_url;
 use crate::{decrypt, encrypt, raise_error};
@@ -235,9 +239,23 @@ impl OAuth2Flow {
         let redirect_uri = RedirectUrl::new(entity.redirect_uri.clone())
             .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InvalidParameter))?;
 
-        // Create and return the OAuth2 client
-        let client = BasicClient::new(ClientId::new(entity.client_id.clone()))
-            .set_client_secret(ClientSecret::new(decrypt!(&entity.client_secret)?))
+        let client = BasicClient::new(ClientId::new(entity.client_id.clone()));
+        let client = match entity.client_type {
+            OAuth2ClientType::Confidential => {
+                let encrypted_secret = entity.client_secret.as_ref().ok_or_else(|| {
+                    raise_error!(
+                        "The confidential OAuth2 client has no stored client secret. Supply a new secret."
+                            .into(),
+                        ErrorCode::InvalidParameter
+                    )
+                })?;
+                client.set_client_secret(ClientSecret::new(decrypt!(encrypted_secret)?))
+            }
+            OAuth2ClientType::Public => client,
+        };
+
+        // Both client types use the same PKCE authorization and token exchange paths.
+        let client = client
             .set_auth_uri(auth_url)
             .set_token_uri(token_url)
             .set_redirect_uri(redirect_uri);
@@ -282,4 +300,228 @@ fn build_http_client(use_proxy: Option<u64>) -> BichonResult<reqwest::Client> {
         .redirect(oauth2::reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oauth2::entity::OAuth2ClientType;
+    use std::{collections::BTreeMap, sync::Once};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::oneshot,
+    };
+
+    static SET_TEST_PASSWORD: Once = Once::new();
+
+    fn set_test_encryption_password() {
+        SET_TEST_PASSWORD.call_once(|| {
+            std::env::set_var(
+                "BICHON_ENCRYPT_PASSWORD",
+                "oauth2-public-client-test-password",
+            );
+        });
+    }
+
+    fn entity(
+        client_type: OAuth2ClientType,
+        client_secret: Option<String>,
+        token_url: String,
+    ) -> OAuth2 {
+        OAuth2 {
+            id: 1,
+            description: Some("test".into()),
+            client_id: "test-client-id".into(),
+            client_type,
+            client_secret,
+            auth_url: "https://provider.example/authorize".into(),
+            token_url,
+            redirect_uri: "http://127.0.0.1:15630/oauth2/callback".into(),
+            scopes: Some(vec!["mail.read".into()]),
+            extra_params: None,
+            enabled: true,
+            use_proxy: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    async fn token_endpoint() -> (String, oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_sender, request_receiver) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+
+            loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+
+                let header_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|position| position + 4);
+                if let Some(header_end) = header_end {
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or_default();
+                    if request.len() >= header_end + content_length {
+                        break;
+                    }
+                }
+            }
+
+            let body = r#"{"access_token":"access","token_type":"Bearer","expires_in":3600,"refresh_token":"refresh"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            request_sender
+                .send(String::from_utf8(request).unwrap())
+                .unwrap();
+        });
+
+        (format!("http://{address}/token"), request_receiver)
+    }
+
+    fn request_body(request: &str) -> &str {
+        request.split_once("\r\n\r\n").unwrap().1
+    }
+
+    fn has_authorization_header(request: &str) -> bool {
+        request
+            .split_once("\r\n\r\n")
+            .unwrap()
+            .0
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+    }
+
+    #[tokio::test]
+    async fn public_code_exchange_uses_pkce_without_client_authentication() {
+        let (token_url, captured_request) = token_endpoint().await;
+        let entity = entity(OAuth2ClientType::Public, None, token_url);
+        let client = OAuth2Flow::new(entity.id)
+            .build_oauth2_client(&entity)
+            .unwrap();
+
+        client
+            .exchange_code(AuthorizationCode::new("authorization-code".into()))
+            .set_pkce_verifier(PkceCodeVerifier::new("pkce-verifier".into()))
+            .request_async(&reqwest::Client::new())
+            .await
+            .unwrap();
+
+        let request = captured_request.await.unwrap();
+        assert!(!has_authorization_header(&request));
+        assert!(!request_body(&request).contains("client_secret="));
+        assert!(request_body(&request).contains("code_verifier=pkce-verifier"));
+    }
+
+    #[tokio::test]
+    async fn public_refresh_omits_client_secret_authentication() {
+        let (token_url, captured_request) = token_endpoint().await;
+        let entity = entity(OAuth2ClientType::Public, None, token_url);
+        let client = OAuth2Flow::new(entity.id)
+            .build_oauth2_client(&entity)
+            .unwrap();
+
+        client
+            .exchange_refresh_token(&RefreshToken::new("refresh-token".into()))
+            .request_async(&reqwest::Client::new())
+            .await
+            .unwrap();
+
+        let request = captured_request.await.unwrap();
+        assert!(!has_authorization_header(&request));
+        assert!(!request_body(&request).contains("client_secret="));
+        assert!(request_body(&request).contains("grant_type=refresh_token"));
+    }
+
+    #[tokio::test]
+    async fn confidential_exchange_and_refresh_keep_basic_authentication() {
+        set_test_encryption_password();
+        let encrypted_secret = encrypt!("test-secret").unwrap();
+
+        for refresh in [false, true] {
+            let (token_url, captured_request) = token_endpoint().await;
+            let entity = entity(
+                OAuth2ClientType::Confidential,
+                Some(encrypted_secret.clone()),
+                token_url,
+            );
+            let client = OAuth2Flow::new(entity.id)
+                .build_oauth2_client(&entity)
+                .unwrap();
+
+            if refresh {
+                client
+                    .exchange_refresh_token(&RefreshToken::new("refresh-token".into()))
+                    .request_async(&reqwest::Client::new())
+                    .await
+                    .unwrap();
+            } else {
+                client
+                    .exchange_code(AuthorizationCode::new("authorization-code".into()))
+                    .set_pkce_verifier(PkceCodeVerifier::new("pkce-verifier".into()))
+                    .request_async(&reqwest::Client::new())
+                    .await
+                    .unwrap();
+            }
+
+            let request = captured_request.await.unwrap();
+            assert!(has_authorization_header(&request));
+        }
+    }
+
+    #[test]
+    fn authorization_urls_include_pkce_challenge_and_state_for_both_types() {
+        for client_type in [OAuth2ClientType::Confidential, OAuth2ClientType::Public] {
+            set_test_encryption_password();
+            let secret = (client_type == OAuth2ClientType::Confidential)
+                .then(|| encrypt!("test-secret").unwrap());
+            let entity = entity(client_type, secret, "https://provider.example/token".into());
+            let client = OAuth2Flow::new(entity.id)
+                .build_oauth2_client(&entity)
+                .unwrap();
+            let (challenge, _) = PkceCodeChallenge::new_random_sha256();
+            let (url, state) = client
+                .authorize_url(|| CsrfToken::new("expected-state".into()))
+                .set_pkce_challenge(challenge)
+                .url();
+
+            let query = url.query_pairs().collect::<BTreeMap<_, _>>();
+            assert_eq!(state.secret(), "expected-state");
+            assert_eq!(query.get("state").unwrap(), "expected-state");
+            assert_eq!(query.get("code_challenge_method").unwrap(), "S256");
+            assert!(query.contains_key("code_challenge"));
+        }
+    }
+
+    #[test]
+    fn confidential_client_without_secret_is_rejected() {
+        let entity = entity(
+            OAuth2ClientType::Confidential,
+            None,
+            "https://provider.example/token".into(),
+        );
+        assert!(OAuth2Flow::new(entity.id)
+            .build_oauth2_client(&entity)
+            .is_err());
+    }
 }

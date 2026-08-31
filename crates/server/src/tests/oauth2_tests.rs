@@ -15,7 +15,8 @@ fn api_client(route: impl poem::Endpoint) -> TestClient<impl poem::Endpoint> {
 #[derive(Debug, Serialize)]
 struct CreateOAuth2Payload {
     client_id: String,
-    client_secret: String,
+    client_type: Option<String>,
+    client_secret: Option<String>,
     auth_url: String,
     token_url: String,
     redirect_uri: String,
@@ -26,11 +27,15 @@ struct CreateOAuth2Payload {
 struct OAuth2Config {
     id: u64,
     client_id: String,
+    client_type: String,
+    client_secret: Option<String>,
     enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct UpdateOAuth2Payload {
+    client_type: Option<String>,
+    client_secret: Option<String>,
     enabled: Option<bool>,
 }
 
@@ -44,7 +49,9 @@ async fn oauth2_crud() {
     // Create
     let create = CreateOAuth2Payload {
         client_id: "test-client-id".into(),
-        client_secret: "test-client-secret".into(),
+        // Omission is intentionally tested for backward compatibility.
+        client_type: None,
+        client_secret: Some("test-client-secret".into()),
         auth_url: "https://provider.example.com/auth".into(),
         token_url: "https://provider.example.com/token".into(),
         redirect_uri: "http://localhost/callback".into(),
@@ -68,7 +75,11 @@ async fn oauth2_crud() {
     let list: serde_json::Value = resp.json().await.value().deserialize();
     let items = list["items"].as_array().expect("items array");
     assert!(!items.is_empty(), "should have at least one OAuth2 config");
-    let id = items[0]["id"].as_u64().unwrap();
+    let id = items
+        .iter()
+        .find(|item| item["client_id"] == "test-client-id")
+        .and_then(|item| item["id"].as_u64())
+        .unwrap();
 
     // Get by ID
     let resp = cli
@@ -77,9 +88,17 @@ async fn oauth2_crud() {
         .send()
         .await;
     resp.assert_status_is_ok();
+    let config: OAuth2Config = resp.json().await.value().deserialize();
+    assert_eq!(config.id, id);
+    assert_eq!(config.client_id, "test-client-id");
+    assert_eq!(config.client_type, "Confidential");
+    assert!(config.client_secret.is_some());
+    assert!(!config.enabled);
 
     // Update
     let update = UpdateOAuth2Payload {
+        client_type: Some("Public".into()),
+        client_secret: None,
         enabled: Some(true),
     };
     let resp = cli
@@ -90,9 +109,59 @@ async fn oauth2_crud() {
         .await;
     resp.assert_status_is_ok();
 
+    let resp = cli
+        .get(&format!("/api/v1/oauth2/{}", id))
+        .header("Authorization", &format!("Bearer {}", token))
+        .send()
+        .await;
+    resp.assert_status_is_ok();
+    let config: OAuth2Config = resp.json().await.value().deserialize();
+    assert_eq!(config.client_type, "Public");
+    assert!(config.client_secret.is_none());
+
+    // Public creation succeeds without a secret.
+    let public_create = CreateOAuth2Payload {
+        client_id: "public-client-id".into(),
+        client_type: Some("Public".into()),
+        client_secret: None,
+        auth_url: "https://provider.example.com/auth".into(),
+        token_url: "https://provider.example.com/token".into(),
+        redirect_uri: "http://localhost/callback".into(),
+        enabled: true,
+    };
+    let resp = cli
+        .post("/api/v1/oauth2")
+        .header("Authorization", &format!("Bearer {}", token))
+        .body_json(&public_create)
+        .send()
+        .await;
+    resp.assert_status_is_ok();
+
+    let resp = cli
+        .get("/api/v1/oauth2-list")
+        .header("Authorization", &format!("Bearer {}", token))
+        .send()
+        .await;
+    resp.assert_status_is_ok();
+    let list: serde_json::Value = resp.json().await.value().deserialize();
+    let public_id = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["client_id"] == "public-client-id")
+        .and_then(|item| item["id"].as_u64())
+        .unwrap();
+
     // Delete
     let resp = cli
         .delete(&format!("/api/v1/oauth2/{}", id))
+        .header("Authorization", &format!("Bearer {}", token))
+        .send()
+        .await;
+    resp.assert_status_is_ok();
+
+    let resp = cli
+        .delete(&format!("/api/v1/oauth2/{}", public_id))
         .header("Authorization", &format!("Bearer {}", token))
         .send()
         .await;
