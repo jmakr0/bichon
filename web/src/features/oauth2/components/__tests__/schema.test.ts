@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { getOAuth2Schema } from '../schema'
+import { buildOAuth2Payload, getOAuth2Schema } from '../schema'
 
 const t = (key: string) => key
 
@@ -8,6 +8,8 @@ describe('OAuth2 Form Schema', () => {
 
   const validData = {
     client_id: 'my-client-id',
+    client_type: 'Confidential' as const,
+    client_secret: 'my-secret',
     auth_url: 'https://accounts.example.com/o/oauth2/auth',
     token_url: 'https://oauth2.example.com/token',
     redirect_uri: 'https://myapp.example.com/oauth2/callback',
@@ -27,17 +29,74 @@ describe('OAuth2 Form Schema', () => {
   })
 
   describe('client_secret field', () => {
-    it('accepts undefined client_secret', () => {
-      const result = schema.safeParse(validData)
+    it('requires a secret for a new confidential client', () => {
+      const result = schema.safeParse({
+        ...validData,
+        client_secret: undefined,
+      })
+      expect(result.success).toBe(false)
+    })
+
+    it('accepts a public client without a secret', () => {
+      const result = schema.safeParse({
+        ...validData,
+        client_type: 'Public',
+        client_secret: undefined,
+      })
       expect(result.success).toBe(true)
     })
 
-    it('accepts provided client_secret', () => {
+    it('rejects a public client with a secret', () => {
       const result = schema.safeParse({
         ...validData,
-        client_secret: 'my-secret',
+        client_type: 'Public',
+      })
+      expect(result.success).toBe(false)
+    })
+
+    it('preserves an existing confidential secret when the field is blank', () => {
+      const editSchema = getOAuth2Schema(t, {
+        isEdit: true,
+        existingClientType: 'Confidential',
+      })
+      const result = editSchema.safeParse({
+        ...validData,
+        client_secret: undefined,
       })
       expect(result.success).toBe(true)
+    })
+
+    it('requires a new secret when changing public to confidential', () => {
+      const editSchema = getOAuth2Schema(t, {
+        isEdit: true,
+        existingClientType: 'Public',
+      })
+      const result = editSchema.safeParse({
+        ...validData,
+        client_secret: undefined,
+      })
+      expect(result.success).toBe(false)
+    })
+
+    it('omits a public client secret from the payload', () => {
+      const result = schema.parse({
+        ...validData,
+        client_type: 'Public',
+        client_secret: undefined,
+      })
+      expect(buildOAuth2Payload(result)).not.toHaveProperty('client_secret')
+    })
+
+    it('omits a blank confidential secret from an edit payload', () => {
+      const editSchema = getOAuth2Schema(t, {
+        isEdit: true,
+        existingClientType: 'Confidential',
+      })
+      const result = editSchema.parse({
+        ...validData,
+        client_secret: '',
+      })
+      expect(buildOAuth2Payload(result)).not.toHaveProperty('client_secret')
     })
   })
 

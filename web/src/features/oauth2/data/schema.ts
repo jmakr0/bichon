@@ -16,19 +16,19 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-
 export interface OAuth2Entity {
-  id: number;
-  description?: string;
-  client_id: string;
-  client_secret: string;
-  auth_url: string;
-  token_url: string;
-  redirect_uri: string;
-  scopes?: string[];
-  extra_params?: Record<string, string>;
-  enabled: boolean;
-  use_proxy?: number;
-  created_at: number;
-  updated_at: number;
+  id: number
+  description?: string
+  client_id: string
+  client_type: 'Confidential' | 'Public'
+  client_secret?: string | null
+  auth_url: string
+  token_url: string
+  redirect_uri: string
+  scopes?: string[]
+  extra_params?: Record<string, string>
+  enabled: boolean
+  use_proxy?: number
+  created_at: number
+  updated_at: number
 }
