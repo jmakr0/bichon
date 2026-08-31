@@ -20,9 +20,9 @@ use crate::{
     common::paginated::DataPage,
     database::{
         delete_impl, find_impl, insert_impl, manager::DB_MANAGER, paginate_impl, update_impl,
-        MemDbModel,
+        upsert_impl, MemDbModel,
     },
-    encrypt,
+    decrypt, encrypt,
     error::{code::ErrorCode, BichonResult},
     id, raise_error, utc_now,
 };
@@ -141,13 +141,24 @@ impl OAuth2 {
         page_size: Option<u64>,
         desc: Option<bool>,
     ) -> BichonResult<DataPage<OAuth2>> {
-        let paginated = paginate_impl::<OAuth2>(DB_MANAGER.db(), page, page_size, desc)?;
+        let mut paginated = paginate_impl::<OAuth2>(DB_MANAGER.db(), page, page_size, desc)?;
+        for oauth2 in &mut paginated.items {
+            if oauth2.migrate_legacy_empty_secret()? {
+                upsert_impl(DB_MANAGER.db(), oauth2.to_owned())?;
+            }
+        }
         Ok(DataPage::from(paginated))
     }
 
     pub fn get(id: u64) -> BichonResult<Option<OAuth2>> {
         let results = find_impl::<OAuth2>(DB_MANAGER.db(), &id.to_string())?;
-        Ok(results.into_iter().next())
+        let Some(mut oauth2) = results.into_iter().next() else {
+            return Ok(None);
+        };
+        if oauth2.migrate_legacy_empty_secret()? {
+            upsert_impl(DB_MANAGER.db(), oauth2.to_owned())?;
+        }
+        Ok(Some(oauth2))
     }
 
     pub fn delete(id: u64) -> BichonResult<()> {
@@ -155,11 +166,30 @@ impl OAuth2 {
     }
 
     pub fn update(id: u64, request: OAuth2UpdateRequest) -> BichonResult<()> {
-        update_impl(DB_MANAGER.db(), &id.to_string(), |current| {
+        update_impl(DB_MANAGER.db(), &id.to_string(), |mut current: OAuth2| {
+            current.migrate_legacy_empty_secret()?;
             apply_update(&current, request)
         })?;
 
         Ok(())
+    }
+
+    fn migrate_legacy_empty_secret(&mut self) -> BichonResult<bool> {
+        if self.client_type != OAuth2ClientType::Confidential {
+            return Ok(false);
+        }
+
+        let Some(encrypted_secret) = &self.client_secret else {
+            return Ok(false);
+        };
+        if !decrypt!(encrypted_secret)?.trim().is_empty() {
+            return Ok(false);
+        }
+
+        self.client_type = OAuth2ClientType::Public;
+        self.client_secret = None;
+        self.updated_at = utc_now!();
+        Ok(true)
     }
 }
 
@@ -402,6 +432,21 @@ mod tests {
         let oauth2: OAuth2 = serde_json::from_value(value).unwrap();
         assert_eq!(oauth2.client_type, OAuth2ClientType::Confidential);
         assert_eq!(oauth2.client_secret.as_deref(), Some("encrypted-secret"));
+    }
+
+    #[test]
+    fn migrates_legacy_empty_secrets_to_public_clients() {
+        set_test_encryption_password();
+        let mut oauth2 = OAuth2::new(create_request(
+            OAuth2ClientType::Confidential,
+            Some("secret"),
+        ))
+        .unwrap();
+        oauth2.client_secret = Some(encrypt!("").unwrap());
+
+        assert!(oauth2.migrate_legacy_empty_secret().unwrap());
+        assert_eq!(oauth2.client_type, OAuth2ClientType::Public);
+        assert!(oauth2.client_secret.is_none());
     }
 
     #[test]
