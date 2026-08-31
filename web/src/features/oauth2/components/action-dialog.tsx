@@ -308,27 +308,6 @@ export function ActionDialog({ currentRow, open, onOpenChange }: Props) {
               />
               <FormField
                 control={form.control}
-                name='client_id'
-                render={({ field }) => (
-                  <FormItem className='flex flex-col gap-y-1 space-y-0'>
-                    <FormLabel className='mb-1'>
-                      {t('oauth2.clientIdLabel')}
-                    </FormLabel>
-                    <FormControl>
-                      <Input
-                        placeholder={t('oauth2.enterYourClientId')}
-                        {...field}
-                      />
-                    </FormControl>
-                    <FormDescription>
-                      {t('oauth2.theUniqueIdentifierForYourApplication')}
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-              <FormField
-                control={form.control}
                 name='client_type'
                 render={({ field }) => (
                   <FormItem className='space-y-3'>
@@ -377,36 +356,58 @@ export function ActionDialog({ currentRow, open, onOpenChange }: Props) {
                   </FormItem>
                 )}
               />
-              {clientType === 'Confidential' && (
-                <FormField
-                  control={form.control}
-                  name='client_secret'
-                  render={({ field }) => (
-                    <FormItem className='flex flex-col gap-y-1 space-y-0'>
-                      <FormLabel className='mb-1'>
-                        {t('oauth2.clientSecretLabel')}
-                      </FormLabel>
-                      <FormControl>
-                        <Input
-                          placeholder={
-                            isEdit
-                              ? t('oauth2.leaveEmptyToKeepExistingSecret')
-                              : t('oauth2.enterYourClientSecret')
-                          }
-                          {...field}
-                          value={field.value ?? ''}
-                        />
-                      </FormControl>
-                      <FormDescription>
-                        {isEdit && existingClientType === 'Confidential'
+              <FormField
+                control={form.control}
+                name='client_id'
+                render={({ field }) => (
+                  <FormItem className='flex flex-col gap-y-1 space-y-0'>
+                    <FormLabel className='mb-1'>
+                      {t('oauth2.clientIdLabel')}
+                    </FormLabel>
+                    <FormControl>
+                      <Input
+                        placeholder={t('oauth2.enterYourClientId')}
+                        {...field}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      {t('oauth2.theUniqueIdentifierForYourApplication')}
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name='client_secret'
+                render={({ field }) => (
+                  <FormItem className='flex flex-col gap-y-1 space-y-0'>
+                    <FormLabel className='mb-1'>
+                      {t('oauth2.clientSecretLabel')}
+                    </FormLabel>
+                    <FormControl>
+                      <Input
+                        disabled={clientType === 'Public'}
+                        placeholder={
+                          isEdit
+                            ? t('oauth2.leaveEmptyToKeepExistingSecret')
+                            : t('oauth2.enterYourClientSecret')
+                        }
+                        {...field}
+                        value={field.value ?? ''}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      {clientType === 'Public'
+                        ? t('oauth2.publicClientDescription')
+                        : isEdit && existingClientType === 'Confidential'
                           ? t('oauth2.leaveEmptyToKeepTheExistingSecret')
                           : t('oauth2.aSecretKeyProvidedByTheOAuthProvider')}
-                      </FormDescription>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-              )}
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
               <FormField
                 control={form.control}
                 name='auth_url'

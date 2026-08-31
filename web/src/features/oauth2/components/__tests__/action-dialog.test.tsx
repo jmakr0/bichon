@@ -30,7 +30,7 @@ describe('OAuth2 client type selection', () => {
     vi.clearAllMocks()
   })
 
-  it('hides and clears the secret for a public client', async () => {
+  it('disables and clears the secret for a public client', async () => {
     const user = userEvent.setup()
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
@@ -47,13 +47,11 @@ describe('OAuth2 client type selection', () => {
     expect(secret).toHaveValue('temporary-secret')
 
     await user.click(screen.getByText('oauth2.publicClient'))
-    expect(
-      screen.queryByPlaceholderText('oauth2.enterYourClientSecret')
-    ).not.toBeInTheDocument()
+    expect(secret).toBeDisabled()
+    expect(secret).toHaveValue('')
 
     await user.click(screen.getByText('oauth2.confidentialClient'))
-    expect(
-      screen.getByPlaceholderText('oauth2.enterYourClientSecret')
-    ).toHaveValue('')
+    expect(secret).toBeEnabled()
+    expect(secret).toHaveValue('')
   })
 })
